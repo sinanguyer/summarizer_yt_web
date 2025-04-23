@@ -1,0 +1,471 @@
+import streamlit as st
+import requests
+from bs4 import BeautifulSoup
+import subprocess
+import sys
+import logging
+import time
+import json
+import re
+from tenacity import retry, stop_after_attempt, wait_fixed
+from functools import lru_cache
+import psutil
+import threading
+import urllib3
+from transformers import AutoProcessor, SeamlessM4TModel
+import os
+import torch
+from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
+
+from transformers import MarianMTModel, MarianTokenizer
+
+# Load model and tokenizer (e.g., English to German)
+model_name = "Helsinki-NLP/opus-mt-en-de"
+tokenizer = MarianTokenizer.from_pretrained(model_name)
+model = MarianMTModel.from_pretrained(model_name)
+
+# Suppress TensorFlow warnings (if TensorFlow is indirectly imported)
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# Suppress InsecureRequestWarning
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+
+# Memory usage tracking
+def print_memory_usage():
+    logger.info(f"RAM used: {psutil.Process().memory_info().rss / 1024 ** 2:.2f} MB")
+
+# Ensure UTF-8 encoding on Windows
+if sys.platform.startswith('win'):
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+
+@lru_cache(maxsize=50)
+def summarize_webpage(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(url, headers=headers, timeout=15, verify=False)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser', from_encoding="utf-8")
+        for element in soup(['script', 'style']):
+            element.decompose()
+            
+        text_content = soup.get_text(separator='\n')
+        cleaned_text = '\n'.join(line.strip() for line in text_content.splitlines() if line.strip())
+        
+        logger.info(f"Extracted text (first 500 chars):\n{cleaned_text[:500]}...")
+        print_memory_usage()
+        return cleaned_text
+        
+    except requests.RequestException as e:
+        logger.error(f"Failed to load webpage: {str(e)}")
+        return f"Error: Could not load webpage - {str(e)}"
+
+def check_ollama_health():
+    try:
+        response = requests.get("http://127.0.0.1:11434/", timeout=5)
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+def start_ollama_process():
+    api_url = "http://127.0.0.1:11434/"
+    if check_ollama_health():
+        logger.info("Ollama server already running.")
+        return None
+
+    logger.info("Ollama server not running, starting now...")
+    try:
+        startupinfo = None
+        if sys.platform.startswith('win'):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+
+        process = subprocess.Popen(
+            ['ollama', 'serve', '--num-threads', str(psutil.cpu_count())],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            startupinfo=startupinfo
+        )
+        
+        for _ in range(15):
+            time.sleep(0.5)
+            if check_ollama_health():
+                logger.info("Ollama server started successfully.")
+                break
+        else:
+            process.terminate()
+            error_output = process.stderr.read()
+            logger.error(f"Ollama server failed to start: {error_output}")
+            return None
+
+        threading.Thread(target=subprocess.run, args=(['ollama', 'run', 'llama3.2:latest', 'exit'],),
+                         kwargs={'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE, 'text': True, 'encoding': 'utf-8', 'startupinfo': startupinfo}).start()
+        print_memory_usage()
+        return process
+
+    except FileNotFoundError:
+        logger.error("Ollama executable not found.")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to start Ollama: {str(e)}")
+        return None
+
+@lru_cache(maxsize=200)
+@retry(stop=stop_after_attempt(2), wait=wait_fixed(5))
+def generate_summary(text):
+    api_url = "http://127.0.0.1:11434/api/generate"
+    max_length = 1000
+    
+    if not check_ollama_health():
+        logger.error("Ollama server unresponsive before summary generation")
+        return "Error: Ollama server unavailable"
+
+    if len(text) < 30:
+        return "Text too short to summarize"
+    if len(text) > max_length:
+        text = text[:max_length]
+        logger.warning(f"Text truncated to {max_length} characters due to size: {len(text)}")
+        
+    prompt = f"Summarize in 2-3 sentences:\n\n{text}"
+    logger.info(f"Generating summary for text of length {len(text)}")
+    
+    start_time = time.time()
+    try:
+        timeout = min(120, max(60, len(text) // 50))
+        response = requests.post(
+            api_url,
+            json={"model": "llama3.2", "prompt": prompt, "raw": True, "stream": True},
+            timeout=timeout,
+            stream=True
+        )
+        response.raise_for_status()
+        
+        summary = ""
+        for chunk in response.iter_lines():
+            if chunk:
+                data = json.loads(chunk.decode('utf-8'))
+                summary += data.get("response", "")
+        result = summary.strip() if summary.strip() else "No summary generated."
+        logger.info(f"Summary generated in {time.time() - start_time:.2f} seconds")
+        print_memory_usage()
+        return result
+        
+    except requests.RequestException as e:
+        logger.error(f"API request failed: {str(e)}")
+        return f"Error: API request failed - {str(e)}"
+
+@lru_cache(maxsize=200)
+@retry(stop=stop_after_attempt(2), wait=wait_fixed(5))
+def answer_question(context, question):
+    api_url = "http://127.0.0.1:11434/api/generate"
+    max_length = 1000
+    
+    if not check_ollama_health():
+        logger.error("Ollama server unresponsive before answering question")
+        return "Error: Ollama server unavailable"
+
+    if not context or not question:
+        return "Error: Context or question missing"
+    if len(context) > max_length:
+        context = context[:max_length]
+        logger.info(f"Context truncated to {max_length} characters")
+        
+    prompt = f"Context: {context}\nQuestion: {question}\nAnswer concisely:"
+    
+    start_time = time.time()
+    try:
+        response = requests.post(
+            api_url,
+            json={"model": "llama3.2", "prompt": prompt, "raw": True, "stream": True},
+            timeout=120,
+            stream=True
+        )
+        response.raise_for_status()
+        
+        answer = ""
+        for chunk in response.iter_lines():
+            if chunk:
+                data = json.loads(chunk.decode('utf-8'))
+                answer += data.get("response", "")
+        result = answer.strip() if answer.strip() else "No answer generated."
+        logger.info(f"Answer generated in {time.time() - start_time:.2f} seconds")
+        print_memory_usage()
+        return result
+        
+    except requests.RequestException as e:
+        logger.error(f"API request failed: {str(e)}")
+        return f"Error: API request failed - {str(e)}"
+
+@lru_cache(maxsize=50)
+def get_youtube_transcript(url):
+    try:
+        video_id = url.split("v=")[1].split("&")[0] if "v=" in url else url.split("/")[-1]
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        response = requests.get(video_url, headers=headers, timeout=15, verify=False)
+        response.raise_for_status()
+
+        caption_match = re.search(r'"captionTracks":\s*\[(.*?)\]', response.text)
+        if not caption_match:
+            logger.error("No captions found.")
+            return "Error: No captions available."
+
+        caption_data = json.loads(f"[{caption_match.group(1)}]")
+        caption_url = caption_data[0].get("baseUrl")
+        if not caption_url:
+            return "Error: No valid caption track found."
+
+        caption_response = requests.get(caption_url, headers=headers, timeout=15, verify=False)
+        caption_response.raise_for_status()
+
+        soup = BeautifulSoup(caption_response.content, 'lxml')
+        transcript_lines = [text.get_text() for text in soup.find_all('text')]
+        full_transcript = " ".join(transcript_lines)
+
+        if not full_transcript.strip():
+            return "Error: Transcript is empty."
+        
+        logger.info(f"Extracted transcript (first 500 chars):\n{full_transcript[:500]}...")
+        print_memory_usage()
+        return full_transcript
+
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch transcript: {str(e)}")
+        return f"Error: Failed to fetch transcript - {str(e)}"
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        return f"Error: Unexpected error - {str(e)}"
+
+def translate_text(text, source_lang, target_lang):
+    try:
+        # MarianMT doesn't use src_lang in tokenizer; model-specific pairs are used
+        # Ensure model_name matches your source-target pair
+        inputs = tokenizer(text, return_tensors="pt", padding=True)
+        translated_tokens = model.generate(**inputs)
+        translated_text = tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
+        logger.info(f"Translated text (first 100 chars): {translated_text[:100]}...")
+        print_memory_usage()
+        return translated_text
+    except Exception as e:
+        logger.error(f"Translation failed: {str(e)}")
+        return f"Error: Translation failed - {str(e)}"
+
+def main():
+    st.set_page_config(page_title="Optimized Web, YouTube & Translation Chatbot", layout="wide")
+    
+    # Initialize session state
+    if 'ollama_process' not in st.session_state:
+        st.session_state.ollama_process = None
+    if 'extracted_text' not in st.session_state:
+        st.session_state.extracted_text = None
+    if 'summary' not in st.session_state:
+        st.session_state.summary = None
+    if 'youtube_transcript' not in st.session_state:
+        st.session_state.youtube_transcript = None
+    if 'youtube_summary' not in st.session_state:
+        st.session_state.youtube_summary = None
+    if 'chat_history_web' not in st.session_state:
+        st.session_state.chat_history_web = {}
+    if 'chat_history_youtube' not in st.session_state:
+        st.session_state.chat_history_youtube = {}
+    if 'web_translated_summary' not in st.session_state:
+        st.session_state.web_translated_summary = None
+    if 'youtube_translated_summary' not in st.session_state:
+        st.session_state.youtube_translated_summary = None
+    if 'translated_text' not in st.session_state:
+        st.session_state.translated_text = None
+
+    st.title("🌐 Optimized Webpage, YouTube & Translation Chatbot")
+    st.markdown("Extract content, generate summaries, and translate them or any text between English, German, Turkish, and French.")
+
+    with st.sidebar:
+        st.header("ℹ️ Information")
+        st.markdown("Extract content, generate summaries, and translate text. Uses Llama3.2 via Ollama and SeamlessM4T for translation.")
+        if st.button("Clear All Data"):
+            st.session_state.chat_history_web = {}
+            st.session_state.chat_history_youtube = {}
+            st.session_state.extracted_text = None
+            st.session_state.summary = None
+            st.session_state.youtube_transcript = None
+            st.session_state.youtube_summary = None
+            st.session_state.web_translated_summary = None
+            st.session_state.youtube_translated_summary = None
+            st.session_state.translated_text = None
+
+    if not st.session_state.ollama_process:
+        with st.spinner("Starting Ollama server..."):
+            st.session_state.ollama_process = start_ollama_process()
+            if not st.session_state.ollama_process and not check_ollama_health():
+                st.error("Failed to start Ollama server.")
+                return
+
+    tab1, tab2, tab3 = st.tabs(["Webpage", "YouTube", "Translation"])
+
+    with tab1:
+        url = st.text_input("Enter a webpage URL:", key="webpage_url")
+        if url and not st.session_state.extracted_text:
+            with st.spinner("Extracting content..."):
+                st.session_state.extracted_text = summarize_webpage(url)
+                if st.session_state.extracted_text.startswith("Error:"):
+                    st.error(st.session_state.extracted_text)
+                else:
+                    st.success("Content extracted!")
+
+        if st.session_state.extracted_text and not st.session_state.extracted_text.startswith("Error:"):
+            if st.button("Generate Summary", key="web_summary_btn"):
+                with st.spinner("Generating summary..."):
+                    st.session_state.summary = generate_summary(st.session_state.extracted_text)
+                    st.session_state.web_translated_summary = None  # Reset translation when new summary is generated
+                    if st.session_state.summary.startswith("Error:"):
+                        st.error(st.session_state.summary)
+                    else:
+                        st.success("Summary generated!")
+            
+            if st.session_state.summary:
+                st.header("📝 Summary")
+                st.markdown(st.session_state.summary)
+
+                # Translation option for the summary
+                web_target_lang = st.selectbox("Translate Summary To:", 
+                                              options=["English", "German", "Turkish", "French"],
+                                              key="web_target_lang")
+                lang_map = {"English": "eng", "German": "deu", "Turkish": "tur", "French": "fra"}
+                web_target_code = lang_map[web_target_lang]
+
+                if st.button("Translate Summary", key="web_translate_btn"):
+                    with st.spinner("Translating summary..."):
+                        # Assuming summary is in English ("eng") as source
+                        st.session_state.web_translated_summary = translate_text(st.session_state.summary, "eng", web_target_code)
+                        if st.session_state.web_translated_summary.startswith("Error:"):
+                            st.error(st.session_state.web_translated_summary)
+                        else:
+                            st.success("Summary translated!")
+
+                if st.session_state.web_translated_summary:
+                    st.subheader(f"Translated Summary ({web_target_lang})")
+                    st.markdown(st.session_state.web_translated_summary)
+
+            st.header("💬 Chat")
+            for q, a in st.session_state.chat_history_web.items():
+                st.markdown(f"**You:** {q}\n**Assistant:** {a}")
+            user_input = st.text_input("Ask a question:", key="webpage_question")
+            if user_input:
+                if user_input in st.session_state.chat_history_web:
+                    response = st.session_state.chat_history_web[user_input]
+                else:
+                    with st.spinner("Thinking..."):
+                        response = answer_question(st.session_state.extracted_text, user_input)
+                        st.session_state.chat_history_web[user_input] = response
+                st.markdown(f"**You:** {user_input}\n**Assistant:** {response}")
+
+    with tab2:
+        youtube_url = st.text_input("Enter a YouTube URL:", key="youtube_url")
+        if youtube_url and not st.session_state.youtube_transcript:
+            with st.spinner("Extracting transcript..."):
+                st.session_state.youtube_transcript = get_youtube_transcript(youtube_url)
+                if st.session_state.youtube_transcript.startswith("Error:"):
+                    st.error(st.session_state.youtube_transcript)
+                else:
+                    st.success("Transcript extracted!")
+
+        if st.session_state.youtube_transcript and not st.session_state.youtube_transcript.startswith("Error:"):
+            st.header("📜 Transcript (First 1000 chars)")
+            st.text(st.session_state.youtube_transcript[:1000])
+
+            if st.button("Generate Summary", key="youtube_summary_btn"):
+                with st.spinner("Generating summary..."):
+                    st.session_state.youtube_summary = generate_summary(st.session_state.youtube_transcript)
+                    st.session_state.youtube_translated_summary = None  # Reset translation when new summary is generated
+                    if st.session_state.youtube_summary.startswith("Error:"):
+                        st.error(st.session_state.youtube_summary)
+                    else:
+                        st.success("Summary generated!")
+            
+            if st.session_state.youtube_summary:
+                st.header("📝 Summary")
+                st.markdown(st.session_state.youtube_summary)
+
+                # Translation option for the summary
+                youtube_target_lang = st.selectbox("Translate Summary To:", 
+                                                  options=["English", "German", "Turkish", "French"],
+                                                  key="youtube_target_lang")
+                lang_map = {"English": "eng", "German": "deu", "Turkish": "tur", "French": "fra"}
+                youtube_target_code = lang_map[youtube_target_lang]
+
+                if st.button("Translate Summary", key="youtube_translate_btn"):
+                    with st.spinner("Translating summary..."):
+                        # Assuming summary is in English ("eng") as source
+                        st.session_state.youtube_translated_summary = translate_text(st.session_state.youtube_summary, "eng", youtube_target_code)
+                        if st.session_state.youtube_translated_summary.startswith("Error:"):
+                            st.error(st.session_state.youtube_translated_summary)
+                        else:
+                            st.success("Summary translated!")
+
+                if st.session_state.youtube_translated_summary:
+                    st.subheader(f"Translated Summary ({youtube_target_lang})")
+                    st.markdown(st.session_state.youtube_translated_summary)
+
+            st.header("💬 Chat")
+            for q, a in st.session_state.chat_history_youtube.items():
+                st.markdown(f"**You:** {q}\n**Assistant:** {a}")
+            user_input = st.text_input("Ask a question:", key="youtube_question")
+            if user_input:
+                if user_input in st.session_state.chat_history_youtube:
+                    response = st.session_state.chat_history_youtube[user_input]
+                else:
+                    with st.spinner("Thinking..."):
+                        response = answer_question(st.session_state.youtube_transcript, user_input)
+                        st.session_state.chat_history_youtube[user_input] = response
+                st.markdown(f"**You:** {user_input}\n**Assistant:** {response}")
+
+    with tab3:
+        st.header("🌍 Text Translation")
+        input_text = st.text_area("Enter text to translate:", key="translation_input")
+        
+        # Language selection
+        source_lang = st.selectbox("Source Language:", 
+                                  options=["English", "German", "Turkish", "French"],
+                                  key="source_lang")
+        target_lang = st.selectbox("Target Language:", 
+                                  options=["English", "German", "Turkish", "French"],
+                                  key="target_lang")
+        
+        # Map to SeamlessM4T language codes
+        lang_map = {"English": "eng", "German": "deu", "Turkish": "tur", "French": "fra"}
+        source_code = lang_map[source_lang]
+        target_code = lang_map[target_lang]
+
+        if st.button("Translate", key="translate_btn") and input_text:
+            with st.spinner("Translating..."):
+                st.session_state.translated_text = translate_text(input_text, source_code, target_code)
+                if st.session_state.translated_text.startswith("Error:"):
+                    st.error(st.session_state.translated_text)
+                else:
+                    st.success("Translation complete!")
+        
+        if st.session_state.translated_text:
+            st.subheader("Translated Text")
+            st.markdown(st.session_state.translated_text)
+
+    if st.session_state.ollama_process and st.button("Stop Ollama Server"):
+        if st.session_state.ollama_process.poll() is None:
+            st.session_state.ollama_process.terminate()
+            logger.info("Ollama process terminated")
+            st.session_state.ollama_process = None
+            st.success("Ollama server stopped.")
+
+if __name__ == "__main__":
+    # Pre-load torch to avoid Streamlit/PyTorch compatibility issues
+    import torch
+    main()
